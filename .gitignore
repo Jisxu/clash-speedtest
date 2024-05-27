@@ -1,3 +1,7 @@
 .vscode
 
 dist/
+*.exe
+
+.idea/*
+result.yaml

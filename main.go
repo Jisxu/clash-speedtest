@@ -9,11 +9,12 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Dreamacro/clash/adapter"
@@ -24,12 +25,30 @@ import (
 )
 
 var (
+	livenessObject     = flag.String("l", "https://speed.cloudflare.com/__down?bytes=%d", "liveness object, support http(s) url, support payload too")
 	configPathConfig   = flag.String("c", "", "configuration file path, also support http(s) url")
 	filterRegexConfig  = flag.String("f", ".*", "filter proxies by name, use regexp")
 	downloadSizeConfig = flag.Int("size", 1024*1024*100, "download size for testing proxies")
 	timeoutConfig      = flag.Duration("timeout", time.Second*5, "timeout for testing proxies")
 	sortField          = flag.String("sort", "b", "sort field for testing proxies, b for bandwidth, t for TTFB")
-	output             = flag.String("output", "", "output result to csv file")
+	output             = flag.String("output", "", "output result to csv/yaml file")
+	concurrent         = flag.Int("concurrent", 4, "download concurrent size")
+)
+
+type CProxy struct {
+	C.Proxy
+	SecretConfig any
+}
+
+type Result struct {
+	Name      string
+	Bandwidth float64
+	TTFB      time.Duration
+}
+
+var (
+	red   = "\033[31m"
+	green = "\033[32m"
 )
 
 type RawConfig struct {
@@ -40,48 +59,55 @@ type RawConfig struct {
 func main() {
 	flag.Parse()
 
+	C.UA = "clash.meta"
+
 	if *configPathConfig == "" {
 		log.Fatalln("Please specify the configuration file")
 	}
 
-	if strings.HasPrefix(*configPathConfig, "http") {
-		resp, err := http.Get(*configPathConfig)
+	var allProxies = make(map[string]CProxy)
+	for _, configPath := range strings.Split(*configPathConfig, ",") {
+		var body []byte
+		var err error
+		if strings.HasPrefix(configPath, "http") {
+			var resp *http.Response
+			resp, err = http.Get(configPath)
+			if err != nil {
+				log.Warnln("failed to fetch config: %s", err)
+				continue
+			}
+			body, err = io.ReadAll(resp.Body)
+		} else {
+			body, err = os.ReadFile(configPath)
+		}
 		if err != nil {
-			log.Fatalln("Failed to fetch config: %s", err)
+			log.Warnln("failed to read config: %s", err)
+			continue
 		}
-		body, err := io.ReadAll(resp.Body)
+
+		lps, err := loadProxies(body)
 		if err != nil {
-			log.Fatalln("Failed to read config: %s", err)
+			log.Fatalln("Failed to convert : %s", err)
 		}
-		*configPathConfig = filepath.Join(os.TempDir(), "clash_config.yaml")
-		if err := os.WriteFile(*configPathConfig, body, 0644); err != nil {
-			log.Fatalln("Failed to write config: %s", err)
+
+		for k, p := range lps {
+			if _, ok := allProxies[k]; !ok {
+				allProxies[k] = p
+			}
 		}
 	}
 
-	if !filepath.IsAbs(*configPathConfig) {
-		currentDir, _ := os.Getwd()
-		*configPathConfig = filepath.Join(currentDir, *configPathConfig)
-	}
-	C.SetHomeDir(os.TempDir())
-	C.SetConfig(*configPathConfig)
-
-	proxies, err := loadProxies()
-	if err != nil {
-		log.Fatalln("Failed to load config: %s", err)
-	}
-
-	filteredProxies := filterProxies(*filterRegexConfig, proxies)
+	filteredProxies := filterProxies(*filterRegexConfig, allProxies)
 	results := make([]Result, 0, len(filteredProxies))
 
 	format := "%s%-42s\t%-12s\t%-12s\033[0m\n"
 
 	fmt.Printf(format, "", "节点", "带宽", "延迟")
 	for _, name := range filteredProxies {
-		proxy := proxies[name]
+		proxy := allProxies[name]
 		switch proxy.Type() {
-		case C.Shadowsocks, C.ShadowsocksR, C.Snell, C.Socks5, C.Http, C.Vmess, C.Trojan:
-			result := TestProxy(name, proxy, *downloadSizeConfig, *timeoutConfig)
+		case C.Shadowsocks, C.ShadowsocksR, C.Snell, C.Socks5, C.Http, C.Vmess, C.Vless, C.Trojan, C.Hysteria, C.Hysteria2, C.WireGuard, C.Tuic:
+			result := TestProxyConcurrent(name, proxy, *downloadSizeConfig, *timeoutConfig, *concurrent)
 			result.Printf(format)
 			results = append(results, *result)
 		case C.Direct, C.Reject, C.Relay, C.Selector, C.Fallback, C.URLTest, C.LoadBalance:
@@ -112,12 +138,18 @@ func main() {
 		}
 	}
 
-	if *output != "" {
-		writeToCSV(*output, results)
+	if strings.EqualFold(*output, "yaml") {
+		if err := writeNodeConfigurationToYAML("result.yaml", results, allProxies); err != nil {
+			log.Fatalln("Failed to write yaml: %s", err)
+		}
+	} else if strings.EqualFold(*output, "csv") {
+		if err := writeToCSV("result.csv", results); err != nil {
+			log.Fatalln("Failed to write csv: %s", err)
+		}
 	}
 }
 
-func filterProxies(filter string, proxies map[string]C.Proxy) []string {
+func filterProxies(filter string, proxies map[string]CProxy) []string {
 	filterRegexp := regexp.MustCompile(filter)
 	filteredProxies := make([]string, 0, len(proxies))
 	for name := range proxies {
@@ -129,18 +161,14 @@ func filterProxies(filter string, proxies map[string]C.Proxy) []string {
 	return filteredProxies
 }
 
-func loadProxies() (map[string]C.Proxy, error) {
-	buf, err := os.ReadFile(C.Path.Config())
-	if err != nil {
-		return nil, err
-	}
+func loadProxies(buf []byte) (map[string]CProxy, error) {
 	rawCfg := &RawConfig{
 		Proxies: []map[string]any{},
 	}
 	if err := yaml.Unmarshal(buf, rawCfg); err != nil {
 		return nil, err
 	}
-	proxies := make(map[string]C.Proxy)
+	proxies := make(map[string]CProxy)
 	proxiesConfig := rawCfg.Proxies
 	providersConfig := rawCfg.Providers
 
@@ -153,7 +181,7 @@ func loadProxies() (map[string]C.Proxy, error) {
 		if _, exist := proxies[proxy.Name()]; exist {
 			return nil, fmt.Errorf("proxy %s is the duplicate name", proxy.Name())
 		}
-		proxies[proxy.Name()] = proxy
+		proxies[proxy.Name()] = CProxy{Proxy: proxy, SecretConfig: config}
 	}
 	for name, config := range providersConfig {
 		if name == provider.ReservedName {
@@ -167,22 +195,11 @@ func loadProxies() (map[string]C.Proxy, error) {
 			return nil, fmt.Errorf("initial proxy provider %s error: %w", pd.Name(), err)
 		}
 		for _, proxy := range pd.Proxies() {
-			proxies[fmt.Sprintf("[%s] %s", name, proxy.Name())] = proxy
+			proxies[fmt.Sprintf("[%s] %s", name, proxy.Name())] = CProxy{Proxy: proxy}
 		}
 	}
 	return proxies, nil
 }
-
-type Result struct {
-	Name      string
-	Bandwidth float64
-	TTFB      time.Duration
-}
-
-var (
-	red   = "\033[31m"
-	green = "\033[32m"
-)
 
 func (r *Result) Printf(format string) {
 	color := ""
@@ -191,10 +208,44 @@ func (r *Result) Printf(format string) {
 	} else if r.Bandwidth > 1024*1024*10 {
 		color = green
 	}
-	fmt.Printf(format, color, formatName(r.Name), formatBandwidth(r.Bandwidth), formatMillseconds(r.TTFB))
+	fmt.Printf(format, color, formatName(r.Name), formatBandwidth(r.Bandwidth), formatMilliseconds(r.TTFB))
 }
 
-func TestProxy(name string, proxy C.Proxy, downloadSize int, timeout time.Duration) *Result {
+func TestProxyConcurrent(name string, proxy C.Proxy, downloadSize int, timeout time.Duration, concurrentCount int) *Result {
+	if concurrentCount <= 0 {
+		concurrentCount = 1
+	}
+
+	chunkSize := downloadSize / concurrentCount
+	totalTTFB := int64(0)
+	downloaded := int64(0)
+
+	var wg sync.WaitGroup
+	start := time.Now()
+	for i := 0; i < concurrentCount; i++ {
+		wg.Add(1)
+		go func(i int) {
+			result, w := TestProxy(name, proxy, chunkSize, timeout)
+			if w != 0 {
+				atomic.AddInt64(&downloaded, w)
+				atomic.AddInt64(&totalTTFB, int64(result.TTFB))
+			}
+			wg.Done()
+		}(i)
+	}
+	wg.Wait()
+	downloadTime := time.Since(start)
+
+	result := &Result{
+		Name:      name,
+		Bandwidth: float64(downloaded) / downloadTime.Seconds(),
+		TTFB:      time.Duration(totalTTFB / int64(concurrentCount)),
+	}
+
+	return result
+}
+
+func TestProxy(name string, proxy C.Proxy, downloadSize int, timeout time.Duration) (*Result, int64) {
 	client := http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
@@ -203,33 +254,37 @@ func TestProxy(name string, proxy C.Proxy, downloadSize int, timeout time.Durati
 				if err != nil {
 					return nil, err
 				}
+				var u16Port uint16
+				if port, err := strconv.ParseUint(port, 10, 16); err == nil {
+					u16Port = uint16(port)
+				}
 				return proxy.DialContext(ctx, &C.Metadata{
 					Host:    host,
-					DstPort: port,
+					DstPort: u16Port,
 				})
 			},
 		},
 	}
 
 	start := time.Now()
-	resp, err := client.Get(fmt.Sprintf("https://speed.cloudflare.com/__down?bytes=%d", downloadSize))
+	resp, err := client.Get(fmt.Sprintf(*livenessObject, downloadSize))
 	if err != nil {
-		return &Result{name, -1, -1}
+		return &Result{name, -1, -1}, 0
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return &Result{name, -1, -1}
+	if resp.StatusCode-http.StatusOK > 100 {
+		return &Result{name, -1, -1}, 0
 	}
 	ttfb := time.Since(start)
 
 	written, _ := io.Copy(io.Discard, resp.Body)
 	if written == 0 {
-		return &Result{name, -1, -1}
+		return &Result{name, -1, -1}, 0
 	}
 	downloadTime := time.Since(start) - ttfb
 	bandwidth := float64(written) / downloadTime.Seconds()
 
-	return &Result{name, bandwidth, ttfb}
+	return &Result{name, bandwidth, ttfb}, written
 }
 
 var (
@@ -266,11 +321,34 @@ func formatBandwidth(v float64) string {
 	return fmt.Sprintf("%.02fTB/s", v)
 }
 
-func formatMillseconds(v time.Duration) string {
+func formatMilliseconds(v time.Duration) string {
 	if v <= 0 {
 		return "N/A"
 	}
 	return fmt.Sprintf("%.02fms", float64(v.Milliseconds()))
+}
+
+func writeNodeConfigurationToYAML(filePath string, results []Result, proxies map[string]CProxy) error {
+	fp, err := os.Create(filePath)
+	if err != nil {
+		return err
+	}
+	defer fp.Close()
+
+	var sortedProxies []any
+	for _, result := range results {
+		if v, ok := proxies[result.Name]; ok {
+			sortedProxies = append(sortedProxies, v.SecretConfig)
+		}
+	}
+
+	bytes, err := yaml.Marshal(sortedProxies)
+	if err != nil {
+		return err
+	}
+
+	_, err = fp.Write(bytes)
+	return err
 }
 
 func writeToCSV(filePath string, results []Result) error {
@@ -294,7 +372,7 @@ func writeToCSV(filePath string, results []Result) error {
 			fmt.Sprintf("%.2f", result.Bandwidth/1024/1024),
 			strconv.FormatInt(result.TTFB.Milliseconds(), 10),
 		}
-		err := csvWriter.Write(line)
+		err = csvWriter.Write(line)
 		if err != nil {
 			return err
 		}
